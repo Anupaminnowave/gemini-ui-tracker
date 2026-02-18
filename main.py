@@ -11,8 +11,18 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = os.getenv("LOCATION")
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
-def mute_video(input_file):
-    """Removes audio if needed, skipping if the muted file already exists."""
+# Supported formats
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi'}
+
+def process_media(input_file):
+    """Handles preprocessing: Mutes videos, skips images."""
+    _, ext = os.path.splitext(input_file.lower())
+    
+    if ext in IMAGE_EXTENSIONS:
+        print(f"🖼️  Image detected. Skipping mute step for {input_file}.")
+        return input_file # Images don't need 'processed' folder muting
+    
     if not os.path.exists("processed"):
         os.makedirs("processed")
         
@@ -28,74 +38,71 @@ def mute_video(input_file):
     return output_file
 
 def upload_to_gcs(local_path):
-    """Uploads to GCS, skipping if the file already exists in the bucket."""
+    """Uploads to GCS, skipping if the file already exists."""
     storage_client = storage.Client(project=PROJECT_ID)
     bucket = storage_client.bucket(BUCKET_NAME)
     
     if not bucket.exists():
-        print(f"☁️ Creating bucket: {BUCKET_NAME}...")
         bucket = storage_client.create_bucket(BUCKET_NAME, location=LOCATION)
         
     blob_name = f"uploads/{os.path.basename(local_path)}"
     blob = bucket.blob(blob_name)
     
-    # SMART CHECK: If blob exists, don't re-upload
     if blob.exists():
         print(f"⏭️  Step 2: Skipping upload, {blob_name} already in GCS.")
     else:
-        print(f"☁️ Step 2: Uploading {local_path} to GCS...")
+        print(f"☁️ Step 2: Uploading to GCS...")
         blob.upload_from_filename(local_path)
         
     return f"gs://{BUCKET_NAME}/{blob_name}"
 
 def analyze_with_gemini(gcs_uri, original_filename):
-    """Analyzes with Gemini, skipping if a local report file already exists."""
+    """Analyzes with Gemini, caching the report locally."""
     report_path = os.path.join("processed", f"report_{original_filename}.txt")
     
-    # SMART CHECK: If report exists locally, just read it
     if os.path.exists(report_path):
-        print(f"⏭️  Step 3: Skipping Gemini analysis, existing report found at {report_path}.")
+        print(f"⏭️  Step 3: Skipping Gemini, existing report found at {report_path}.")
         with open(report_path, "r", encoding="utf-8") as f:
             return f.read()
 
     vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = GenerativeModel("gemini-2.0-flash-001") # Using stable 2.0 Flash
-    video_part = Part.from_uri(mime_type="video/mp4", uri=gcs_uri)
+    model = GenerativeModel("gemini-2.0-flash-001")
+    
+    # Determine MIME type based on extension
+    _, ext = os.path.splitext(original_filename.lower())
+    mime_type = "video/mp4" if ext in VIDEO_EXTENSIONS else f"image/{ext[1:]}"
+    if ext == ".jpg": mime_type = "image/jpeg"
+
+    media_part = Part.from_uri(mime_type=mime_type, uri=gcs_uri)
     
     prompt = """
-    Perform a comprehensive UI/UX audit on this screen recording.
-    1. Document the end-to-end user workflow, listing every click and interaction.
-    2. Identify any 'Dead Clicks' or unresponsive elements.
-    3. Look for visual bugs, overlapping text, or broken animations.
-    4. Provide timestamps for every defect.
-    5. Evaluate system response time (laggy vs snappy).
+    Perform a comprehensive UI/UX audit.
+    If this is a VIDEO: Document the workflow, look for dead clicks, visual bugs, and lag.
+    If this is an IMAGE: Describe everything on the site, identify UI discrepancies, 
+    misaligned elements, or overlapping text. Explain the layout clearly.
     """
     
-    print("🤖 Step 3: Gemini is analyzing the workflow for defects...")
-    response = model.generate_content([video_part, prompt])
+    print(f"🤖 Step 3: Gemini is analyzing the {'video' if ext in VIDEO_EXTENSIONS else 'image'}...")
+    response = model.generate_content([media_part, prompt])
     
-    # Save the report for next time
+    if not os.path.exists("processed"): os.makedirs("processed")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(response.text)
     
     return response.text
 
 if __name__ == "__main__":
-    video_filename = "test_case2_silent.mp4" 
+    # Change this to your filename (e.g., "screenshot.png" or "test.mp4")
+    video_filename = "test_case1_silent.mp4" 
     input_path = os.path.join("recordings", video_filename)
     
     if os.path.exists(input_path):
         try:
-            muted_path = mute_video(input_path)
-            gcs_link = upload_to_gcs(muted_path)
+            processed_path = process_media(input_path)
+            gcs_link = upload_to_gcs(processed_path)
             report = analyze_with_gemini(gcs_link, video_filename)
-            
-            print("\n" + "="*50)
-            print("🔍 QA DEFECT REPORT")
-            print("="*50)
-            print(report)
-            
+            print(f"\n{'='*20} REPORT {'='*20}\n{report}")
         except Exception as e:
-            print(f"❌ Error during execution: {e}")
+            print(f"❌ Error: {e}")
     else:
-        print(f"❌ Video not found at {input_path}")
+        print(f"❌ File not found at {input_path}")
