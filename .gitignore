@@ -1,0 +1,16 @@
+# Credentials and Secrets
+.env
+*.json
+application_default_credentials.json
+
+# Python Virtual Environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Data and Videos (Large Files)
+recordings/
+processed/
+
+# System Files
+.DS_Store
