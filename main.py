@@ -12,70 +12,83 @@ LOCATION = os.getenv("LOCATION")
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
 def mute_video(input_file):
-    """Removes audio from video using FFmpeg and saves it in the 'processed' folder."""
+    """Removes audio if needed, skipping if the muted file already exists."""
     if not os.path.exists("processed"):
         os.makedirs("processed")
         
     output_file = os.path.join("processed", f"muted_{os.path.basename(input_file)}")
-    print(f"🔇 Step 1: Muting {input_file}...")
     
-    # -an removes audio, -vcodec copy keeps quality high
+    if os.path.exists(output_file):
+        print(f"⏭️  Step 1: Skipping mute, {output_file} already exists.")
+        return output_file
+
+    print(f"🔇 Step 1: Muting {input_file}...")
     cmd = f"ffmpeg -i {input_file} -an -vcodec copy {output_file} -y"
     subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     return output_file
 
 def upload_to_gcs(local_path):
-    """Uploads the muted video to GCS using your storage.admin permissions."""
+    """Uploads to GCS, skipping if the file already exists in the bucket."""
     storage_client = storage.Client(project=PROJECT_ID)
     bucket = storage_client.bucket(BUCKET_NAME)
     
-    # Create bucket if it doesn't exist
     if not bucket.exists():
         print(f"☁️ Creating bucket: {BUCKET_NAME}...")
         bucket = storage_client.create_bucket(BUCKET_NAME, location=LOCATION)
         
-    blob = bucket.blob(f"uploads/{os.path.basename(local_path)}")
-    print(f"☁️ Step 2: Uploading {local_path} to GCS...")
-    blob.upload_from_filename(local_path)
-    return f"gs://{BUCKET_NAME}/uploads/{os.path.basename(local_path)}"
-
-def analyze_with_gemini(gcs_uri):
-    """Sends the GCS video link to Vertex AI for a full UI defect analysis."""
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    blob_name = f"uploads/{os.path.basename(local_path)}"
+    blob = bucket.blob(blob_name)
     
-    # Using Gemini 1.5 Flash for multimodal video analysis
-    model = GenerativeModel("gemini-2.5-flash")
+    # SMART CHECK: If blob exists, don't re-upload
+    if blob.exists():
+        print(f"⏭️  Step 2: Skipping upload, {blob_name} already in GCS.")
+    else:
+        print(f"☁️ Step 2: Uploading {local_path} to GCS...")
+        blob.upload_from_filename(local_path)
+        
+    return f"gs://{BUCKET_NAME}/{blob_name}"
+
+def analyze_with_gemini(gcs_uri, original_filename):
+    """Analyzes with Gemini, skipping if a local report file already exists."""
+    report_path = os.path.join("processed", f"report_{original_filename}.txt")
+    
+    # SMART CHECK: If report exists locally, just read it
+    if os.path.exists(report_path):
+        print(f"⏭️  Step 3: Skipping Gemini analysis, existing report found at {report_path}.")
+        with open(report_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    model = GenerativeModel("gemini-2.0-flash-001") # Using stable 2.0 Flash
     video_part = Part.from_uri(mime_type="video/mp4", uri=gcs_uri)
     
-    # Broad UI Testing Prompt
     prompt = """
     Perform a comprehensive UI/UX audit on this screen recording.
     1. Document the end-to-end user workflow, listing every click and interaction.
-    2. Identify any 'Dead Clicks' or unresponsive elements where the user interacts but the UI does not change.
-    3. Look for visual bugs, such as overlapping text, broken animations, or unexpected error messages.
-    4. For every defect found, provide the exact timestamp and a description of what failed.
-    5. Evaluate the overall system response time—does the UI feel laggy or snappy?
+    2. Identify any 'Dead Clicks' or unresponsive elements.
+    3. Look for visual bugs, overlapping text, or broken animations.
+    4. Provide timestamps for every defect.
+    5. Evaluate system response time (laggy vs snappy).
     """
     
     print("🤖 Step 3: Gemini is analyzing the workflow for defects...")
     response = model.generate_content([video_part, prompt])
+    
+    # Save the report for next time
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(response.text)
+    
     return response.text
 
 if __name__ == "__main__":
-    # Ensure this file exists in your recordings/ folder
-    video_filename = "test_case1_silent.mp4" 
+    video_filename = "test_case2_silent.mp4" 
     input_path = os.path.join("recordings", video_filename)
     
     if os.path.exists(input_path):
         try:
-            # Step 1: Pre-process
             muted_path = mute_video(input_path)
-            
-            # Step 2: Store
             gcs_link = upload_to_gcs(muted_path)
-            
-            # Step 3: Analyze
-            report = analyze_with_gemini(gcs_link)
+            report = analyze_with_gemini(gcs_link, video_filename)
             
             print("\n" + "="*50)
             print("🔍 QA DEFECT REPORT")
