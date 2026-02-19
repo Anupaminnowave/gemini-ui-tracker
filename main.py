@@ -1,78 +1,88 @@
 import os
 import subprocess
+import mimetypes
 from dotenv import load_dotenv
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part
 from google.cloud import storage
 
+# LangSmith core imports
+from langsmith import traceable, Client
+from langsmith.run_helpers import get_current_run_tree
+
 # Load configuration from .env
 load_dotenv()
+
 PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = os.getenv("LOCATION")
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
-# Supported formats
-IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
-VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi'}
+ls_client = Client()
 
-def process_media(input_file):
-    """Handles preprocessing: Mutes videos, skips images."""
-    _, ext = os.path.splitext(input_file.lower())
-    
-    if ext in IMAGE_EXTENSIONS:
-        print(f"🖼️  Image detected. Skipping mute step for {input_file}.")
-        return input_file # Images don't need 'processed' folder muting
-    
-    if not os.path.exists("processed"):
-        os.makedirs("processed")
-        
+def get_mime_type(file_path):
+    """Detects MIME type for Vertex AI strictness."""
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if not mime_type:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ['.jpg', '.jpeg']: return "image/jpeg"
+        if ext == '.png': return "image/png"
+        if ext == '.mp4': return "video/mp4"
+    return mime_type
+
+@traceable
+def preprocess_video(input_file):
+    """
+    Rule 1: Only preprocess (mute) if it's a video and hasn't been done yet.
+    Images skip this function entirely in the main logic.
+    """
+    os.makedirs("processed", exist_ok=True)
     output_file = os.path.join("processed", f"muted_{os.path.basename(input_file)}")
     
     if os.path.exists(output_file):
-        print(f"⏭️  Step 1: Skipping mute, {output_file} already exists.")
+        print(f"⏭️  Step 1: Video mute skipped (muted file already exists).")
         return output_file
 
-    print(f"🔇 Step 1: Muting {input_file}...")
+    print(f"🔇 Step 1: Muting video {input_file}...")
     cmd = f"ffmpeg -i {input_file} -an -vcodec copy {output_file} -y"
     subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     return output_file
 
+@traceable
 def upload_to_gcs(local_path):
-    """Uploads to GCS, skipping if the file already exists."""
+    """
+    Rule 2: Skip upload if the file already exists in the GCS bucket.
+    """
     storage_client = storage.Client(project=PROJECT_ID)
     bucket = storage_client.bucket(BUCKET_NAME)
-    
-    if not bucket.exists():
-        bucket = storage_client.create_bucket(BUCKET_NAME, location=LOCATION)
-        
     blob_name = f"uploads/{os.path.basename(local_path)}"
     blob = bucket.blob(blob_name)
     
     if blob.exists():
-        print(f"⏭️  Step 2: Skipping upload, {blob_name} already in GCS.")
+        print(f"⏭️  Step 2: GCS skip (File already exists in bucket).")
     else:
         print(f"☁️ Step 2: Uploading to GCS...")
-        blob.upload_from_filename(local_path)
+        blob.upload_from_filename(local_path, timeout=600)
         
     return f"gs://{BUCKET_NAME}/{blob_name}"
 
+@traceable(run_type="llm", name="Gemini UI Analysis")
 def analyze_with_gemini(gcs_uri, original_filename):
-    """Analyzes with Gemini, caching the report locally."""
-    report_path = os.path.join("processed", f"report_{original_filename}.txt")
+    """
+    Rule 3: Skip Gemini API call if a local report already exists.
+    """
+    report_filename = f"report_{os.path.basename(original_filename)}.txt"
+    report_path = os.path.join("processed", report_filename)
     
     if os.path.exists(report_path):
-        print(f"⏭️  Step 3: Skipping Gemini, existing report found at {report_path}.")
+        print(f"⏭️  Step 3: Gemini skip (Local report found: {report_path}).")
         with open(report_path, "r", encoding="utf-8") as f:
             return f.read()
 
+    mime_type = get_mime_type(original_filename)
     vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = GenerativeModel("gemini-2.5-flash")
+    model = GenerativeModel("gemini-2.0-flash") 
     
-    # Determine MIME type based on extension
-    _, ext = os.path.splitext(original_filename.lower())
-    mime_type = "video/mp4" if ext in VIDEO_EXTENSIONS else f"image/{ext[1:]}"
-    if ext == ".jpg": mime_type = "image/jpeg"
-
+    print(f"🤖 Step 3: Sending to Gemini API ({mime_type})...")
     media_part = Part.from_uri(mime_type=mime_type, uri=gcs_uri)
     
     prompt = """
@@ -82,27 +92,57 @@ def analyze_with_gemini(gcs_uri, original_filename):
     misaligned elements, or overlapping text. Explain the layout clearly.
     """
     
-    print(f"🤖 Step 3: Gemini is analyzing the {'video' if ext in VIDEO_EXTENSIONS else 'image'}...")
     response = model.generate_content([media_part, prompt])
     
-    if not os.path.exists("processed"): os.makedirs("processed")
+    # Save the report for future Rule 3 skips
+    os.makedirs("processed", exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(response.text)
+    
+    # LangSmith Token Metadata
+    run_tree = get_current_run_tree()
+    if run_tree:
+        usage = {
+            "prompt_tokens": response.usage_metadata.prompt_token_count,
+            "completion_tokens": response.usage_metadata.candidates_token_count,
+            "total_tokens": response.usage_metadata.total_token_count
+        }
+        run_tree.end(outputs={"report": response.text})
+        run_tree.metadata.update(usage)
     
     return response.text
 
 if __name__ == "__main__":
-    # Change this to your filename (e.g., "screenshot.png" or "test.mp4")
-    video_filename = "sample_screenshot1.png" 
-    input_path = os.path.join("snapshots", video_filename)
-    
-    if os.path.exists(input_path):
+    if not os.getenv("LANGSMITH_API_KEY"):
+        print("❌ Error: LANGSMITH_API_KEY not found.")
+    else:
         try:
-            processed_path = process_media(input_path)
-            gcs_link = upload_to_gcs(processed_path)
-            report = analyze_with_gemini(gcs_link, video_filename)
-            print(f"\n{'='*20} REPORT {'='*20}\n{report}")
+            target_file = "recordings/test_case1_silent.mp4" # Input file
+            
+            if not os.path.exists(target_file):
+                print(f"❌ File not found: {target_file}")
+            else:
+                print(f"🚀 Processing: {target_file}")
+                
+                mime = get_mime_type(target_file)
+                
+                # BRANCHING LOGIC: Only videos go to Step 1
+                if mime and mime.startswith("video"):
+                    work_path = preprocess_video(target_file)
+                else:
+                    print("🖼️  Step 1: Skipping (Images require no preprocessing).")
+                    work_path = target_file
+                
+                # Step 2: Upload (Rule 2 check is inside the function)
+                gcs_uri = upload_to_gcs(work_path)
+                
+                # Step 3: Analyze (Rule 3 check is inside the function)
+                report = analyze_with_gemini(gcs_uri, target_file)
+                
+                print(f"\n{'='*20} AUDIT REPORT {'='*20}\n{report}")
+            
         except Exception as e:
             print(f"❌ Error: {e}")
-    else:
-        print(f"❌ File not found at {input_path}")
+        finally:
+            print("\n📤 Finalizing LangSmith connection...")
+            ls_client.flush()
