@@ -66,7 +66,7 @@ def analyze_with_gemini(gcs_uri, original_filename):
             return f.read()
 
     vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = GenerativeModel("gemini-2.0-flash-001")
+    model = GenerativeModel("gemini-2.5-flash")
     
     # Determine MIME type based on extension
     _, ext = os.path.splitext(original_filename.lower())
@@ -93,8 +93,8 @@ def analyze_with_gemini(gcs_uri, original_filename):
 
 if __name__ == "__main__":
     # Change this to your filename (e.g., "screenshot.png" or "test.mp4")
-    video_filename = "test_case1_silent.mp4" 
-    input_path = os.path.join("recordings", video_filename)
+    video_filename = "sample_screenshot1.png" 
+    input_path = os.path.join("snapshots", video_filename)
     
     if os.path.exists(input_path):
         try:
